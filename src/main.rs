@@ -1,135 +1,89 @@
-use visioncortex::color_clusters::{Runner, RunnerConfig};
-use visioncortex::image::ColorImage;
-use visioncortex::color::Color;
-use visioncortex::path::PathSimplifyMode;
-
-use image::{DynamicImage, Pixel};
-
-use std::fs::File;
+use clap::Clap;
+use rayon::prelude::*;
+use std::fs::read_dir;
+use std::fs::DirEntry;
+use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::Command;
+use video2svg::image_to_svg;
 
-use clap::{Arg, App};
-
-fn convert_to_color_image(img: DynamicImage) -> ColorImage {
-    let image_rgba = img.to_rgba();
-    let mut new_image = ColorImage::new_w_h(image_rgba.width() as usize, image_rgba.height() as usize);
-
-    for (x, y, pixel) in image_rgba.enumerate_pixels() {
-        let channels = pixel.channels();
-        new_image.set_pixel(x as usize, y as usize, &Color {
-            r: channels[0] as u8,
-            g: channels[1] as u8,
-            b: channels[2] as u8,
-            a: channels[3] as u8
-        })
-    }
-
-    new_image
+#[derive(Clap)]
+struct Opts {
+    #[clap(subcommand)]
+    subcmd: SubCommand,
 }
 
-struct SvgFill {
-    path_string: String,
-    color: Color
+#[derive(Clap)]
+enum SubCommand {
+    SingleImage(SingleImageCommand),
+    Batch(BatchCommand),
 }
 
-struct SvgBuilder {
-    fill: Vec<SvgFill>,
-    width: usize,
-    height: usize,
+#[derive(Clap)]
+pub struct SingleImageCommand {
+    input: PathBuf,
+    output: PathBuf,
 }
 
-impl SvgBuilder {
-    fn new(width: usize, height: usize) -> SvgBuilder {
-        SvgBuilder {
-            fill: Vec::new(),
-            width,
-            height,
-        }
-    }
-
-    fn add_fill(&mut self, path: String, color: Color) {
-        self.fill.push(SvgFill {
-            path_string: path,
-            color,
-        })
-    }
-
-    fn to_vector_file(&self) -> String {
-        let mut result = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
-        <svg width="{}" height="{}">
-        "#, self.width, self.height);
-
-        for fill in &self.fill {
-            let color = fill.color;
-            result.push_str(&format!("<path d=\"{}\" fill=\"#{:02x}{:02x}{:02x}\"/>\n", fill.path_string, color.r, color.g, color.b));
-        };
-
-        result.push_str("</svg>");
-        result
-    }
+#[derive(Clap)]
+pub struct BatchCommand {
+    input: PathBuf,
+    output: PathBuf,
 }
 
 fn main() {
-    let matches = App::new("convert bitmap picture to vector picture")
-        .arg(Arg::with_name("input")
-            .short("i")
-            .required(true)
-            .takes_value(true))
-        .arg(Arg::with_name("output")
-            .short("o")
-            .required(true)
-            .takes_value(true))
-        .get_matches();
+    let matches = Opts::parse();
 
-    let input_path = PathBuf::from(matches.value_of("input").unwrap());
-    let output_path = PathBuf::from(matches.value_of("output").unwrap());
+    match matches.subcmd {
+        SubCommand::SingleImage(subcommand) => {
+            let img = image::open(subcommand.input).unwrap();
 
-    // first, try to run this
-    let img = image::open(input_path).unwrap();
-    let image_converted = convert_to_color_image(img);
+            let svg = image_to_svg(img);
 
-    let (width, height) = (image_converted.width, image_converted.height);
+            let mut out_file = File::create(subcommand.output).unwrap();
+            out_file
+                .write_all(&svg.to_vector_file().as_bytes())
+                .unwrap();
+        }
+        SubCommand::Batch(subcommand) => {
+            create_dir_all(&subcommand.output).unwrap();
 
-    let runner = Runner::new(RunnerConfig {
-        batch_size: 25600,
-        good_min_area: 4,
-        good_max_area: (width * height),
-        is_same_color_a: 2,
-        is_same_color_b: 1,
-        deepen_diff: 4,
-        hollow_neighbours: 1,
-    }, image_converted);
+            let mut list_of_file_in_inputs = vec![];
 
-    let mut clustering = runner.start();
+            for e in read_dir(&subcommand.input).unwrap() {
+                list_of_file_in_inputs.push(e.unwrap());
+            }
 
-    while !clustering.tick() {
-        println!("clustering tick");
-    };
+            let handle_direntry = |direntry: &DirEntry| {
+                let source_path = direntry.path();
+                let target_path = subcommand.output.clone().join(format!(
+                    "{}.svg",
+                    source_path.file_name().unwrap().to_str().unwrap()
+                ));
+                let target_path_png = target_path.parent().unwrap().join(format!(
+                    "{}.png",
+                    target_path.file_name().unwrap().to_str().unwrap()
+                ));
 
-    let clusters = clustering.result();
+                if !target_path_png.exists() {
+                    let img = image::open(source_path).unwrap();
+                    let svg = image_to_svg(img);
+                    let mut out_file = File::create(&target_path).unwrap();
+                    out_file
+                        .write_all(&svg.to_vector_file().as_bytes())
+                        .unwrap();
+                    Command::new("inkscape")
+                        .arg(target_path.to_str().unwrap())
+                        .arg("-o")
+                        .arg(target_path_png.to_str().unwrap())
+                        .arg("-C")
+                        .output()
+                        .unwrap();
+                }
+            };
 
-    let view = clusters.view();
-
-    let mut svg = SvgBuilder::new(width, height);
-    for this_cluster_output in view.clusters_output.iter().rev() {
-        println!("vectorize tick");
-        let cluster = view.get_cluster(*this_cluster_output);
-        let svg_path = cluster.to_svg_path(
-            &view,
-            false,
-            PathSimplifyMode::Polygon,
-            10.0,
-            4.0,
-            32,
-            15.0
-        );
-        svg.add_fill(svg_path, cluster.residue_color());
-    };
-
-    let mut out_file = File::create(output_path).unwrap();
-    out_file.write_all(&svg.to_vector_file().as_bytes()).unwrap();
+            list_of_file_in_inputs.par_iter().for_each(handle_direntry);
+        }
+    }
 }
-
-
-// gradient step: 32
